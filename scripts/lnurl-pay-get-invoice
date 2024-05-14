@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+
+"""lnurl pay get invoice"""
+
+# requirements: requests[socks]
+
+# https://github.com/sipa/bech32/blob/master/ref/python/segwit_addr.py
+# https://github.com/lnurl/luds/blob/luds/01.md
+# https://github.com/lnurl/luds/blob/luds/06.md
+# https://github.com/lnurl/luds/blob/luds/12.md
+# https://github.com/lnurl/luds/blob/luds/16.md
+# https://github.com/lnurl/luds/blob/luds/17.md
+# https://github.com/andrerfneves/lightning-address/blob/main/DIY.md
+
+# some code adapted from Pieter Wuille reference implementation for bech32/bech32m
+
+import sys
+import re
+import json
+
+import requests
+
+
+INFO = """\
+lnurl-pay-get-invoice [-v | -vv] [-d, --decode] data [amount] [comment]
+
+data can be:
+    invoice normal, invoice protocol, lnurl bech32,
+    lnurl url, lnurl protocol, lnurl lightning address
+
+if data is not invoice amount should be present
+if service allows comments, comment can be present
+
+if --decode, simply decode the url, without making the requests
+"""
+
+program_state = {
+    "verbose": 0,
+    "decode": False
+}
+
+
+def bech32_polymod(values):
+    """Internal function that computes the Bech32 checksum."""
+    generator = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for value in values:
+        top = chk >> 25
+        chk = (chk & 0x1ffffff) << 5 ^ value
+        for i in range(5):
+            chk ^= generator[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def bech32_hrp_expand(hrp):
+    """Expand the HRP into values for checksum computation."""
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+
+def bech32_verify_checksum(hrp, data):
+    """Verify a checksum given HRP and converted data characters."""
+    bech32m_const = 0x2bc830a3
+    const = bech32_polymod(bech32_hrp_expand(hrp) + data)
+    if const == 1:
+        return "BECH32"
+    if const == bech32m_const:
+        return "BECH32M"
+    return None
+
+
+def bech32_decode_data(bech):
+    """Validate a Bech32/Bech32m string, and determine HRP and data."""
+    charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+    if ((any(ord(x) < 33 or ord(x) > 126 for x in bech)) or
+            (bech.lower() != bech and bech.upper() != bech)):
+        return (None, None, None)
+    bech = bech.lower()
+    pos = bech.rfind('1')
+    # max_pos = 90
+    max_pos = 1023
+    if pos < 1 or pos + 7 > len(bech) or len(bech) > max_pos:
+        return (None, None, None)
+    if not all(x in charset for x in bech[pos+1:]):
+        return (None, None, None)
+    hrp = bech[:pos]
+    data = [charset.find(x) for x in bech[pos+1:]]
+    spec = bech32_verify_checksum(hrp, data)
+    if spec is None:
+        return (None, None, None)
+    return (hrp, data[:-6], spec)
+
+
+def convertbits(data, frombits, tobits, pad=True):
+    """General power-of-2 base conversion."""
+    acc = 0
+    bits = 0
+    ret = []
+    maxv = (1 << tobits) - 1
+    max_acc = (1 << (frombits + tobits - 1)) - 1
+    for value in data:
+        if value < 0 or (value >> frombits):
+            return None
+        acc = ((acc << frombits) | value) & max_acc
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            ret.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        return None
+    return ret
+
+
+def decoded_to_string(decoded):
+    """Convert decoded array to string"""
+    return bytes(decoded).decode("utf-8")
+
+
+def bech32_decode(input_data):
+    """decode bech32 input"""
+    hrp, data, spec = bech32_decode_data(input_data)
+    if hrp is None or data is None or spec is None:
+        print_err("decoding bech32")
+        return False
+
+    decoded = convertbits(data, 5, 8, False)
+    if decoded is None:
+        print_err("converting bits")
+        return False
+
+    return decoded_to_string(decoded)
+
+
+def print_out(string, end="\n"):
+    """Print to stdout"""
+
+    print(string, end=end)
+
+
+def print_err(string, end="\n", error=True):
+    """Print an error to stderr"""
+    string_print = string
+    if error:
+        string_print = "error: " + string_print
+
+    print(string_print, end=end, file=sys.stderr)
+
+
+def get_int(string_number):
+    """cast a string to init"""
+    try:
+        number = int(string_number)
+    except (ValueError, TypeError):
+        print_err(f"{string_number} is not a number")
+        return False
+
+    return number
+
+
+def get_uint(string_number):
+    """cast a string to uint"""
+    number = get_int(string_number)
+    if number is False:
+        return False
+
+    if number < 0:
+        print_err(f"{number} is not positive")
+        return False
+
+    return number
+
+
+def json_loads(data):
+    """convert string to json dict"""
+    try:
+        return json.loads(data)
+    except json.decoder.JSONDecodeError:
+        return False
+
+
+def json_dumps(data):
+    """convert json dict to string"""
+    return json.dumps(data, indent=4)
+
+
+def requests_tor(url):
+    """make a requests using tor"""
+    proxies = {
+        "http": "socks5h://127.0.0.1:9050",
+        "https": "socks5h://127.0.0.1:9050"
+    }
+
+    # requests.utils.default_headers()
+    headers = {
+        "User-Agent": "python",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept": "*/*",
+        "Connection": "keep-alive"
+    }
+
+    timeout = 120
+
+    try:
+        response = requests.get(
+            url, proxies=proxies, timeout=timeout, headers=headers
+        )
+
+        if not hasattr(response, "text"):
+            print_err("response does not have text")
+            return False
+
+        return response.text
+    except requests.exceptions.RequestException as e:
+        print_err(e, error=False)
+        print_err("getting response")
+        return False
+
+
+def response_json_check_error(response_json):
+    """check if the the json response is an error"""
+    status = response_json.get("status", False)
+    if status is not False:
+        print_err(json_dumps(response_json), error=False)
+        return False
+
+    return True
+
+
+def lnurl_pay_invoice(callback, amount, comment):
+    """make the second url requests to get the invoice"""
+    if re.search('\\?', callback) is not None:
+        callback_char = "&"
+    else:
+        callback_char = "?"
+
+    callback_get_data = "amount=" + str(amount)
+    if comment is not None:
+        callback_get_data = callback_get_data + "&comment=" + comment
+
+    response_invoice = requests_tor(callback + callback_char + callback_get_data)
+    if response_invoice is False:
+        return False
+
+    response_invoice_json = json_loads(response_invoice)
+    if response_invoice_json is False:
+        print_err(response_invoice, error=False)
+        print_err("invoice response is not json")
+        return False
+
+    if response_json_check_error(response_invoice_json) is False:
+        return False
+
+    if program_state["verbose"] >= 2:
+        print_out(json_dumps(response_invoice_json))
+
+    invoice = response_invoice_json.get("pr", False)
+    if invoice is False:
+        print_err(json_dumps(response_invoice_json), error=False)
+        print_err("response does not have invoice")
+        return False
+
+    return invoice
+
+
+def lnurl_pay_callback(url, input_data):
+    """make the first url requests to get the callback"""
+    if program_state["decode"] is True:
+        return url
+
+    amount = input_data["amount"]
+    comment = input_data["comment"]
+
+    if amount is None:
+        print_err("amount is not present")
+        return False
+
+    response = requests_tor(url)
+    if response is False:
+        return False
+
+    response_json = json_loads(response)
+    if response_json is False:
+        print_err(response, error=False)
+        print_err("callback response is not json")
+        return False
+
+    if response_json_check_error(response_json) is False:
+        return False
+
+    if program_state["verbose"] >= 2:
+        print_out(json_dumps(response_json))
+
+    callback = response_json.get("callback", False)
+    if callback is False:
+        print_err("response does not have callback")
+        return False
+
+    tag = response_json.get("tag", False)
+    if tag is False:
+        print_err("response does not have tag")
+        return False
+
+    if tag != "payRequest":
+        print_err("tag {tag} is not payRequest")
+        return False
+
+    max_sendable = response_json.get("maxSendable", False)
+    if max_sendable is False:
+        print_err("response does not have maxSendable")
+        return False
+
+    min_sendable = response_json.get("minSendable", False)
+    if min_sendable is False:
+        print_err("response does not have minSendable")
+        return False
+
+    if amount < min_sendable or amount > max_sendable:
+        print_err("amount {amount} is not between {min_sendable} and {max_sendable}")
+        return False
+
+    comment_allowed = response_json.get("commentAllowed", False)
+    if comment_allowed is False and comment is not None:
+        print_err("comments are not allowed")
+        return False
+
+    if comment is not None:
+        comment_len = len(comment)
+        if comment_len > comment_allowed:
+            print_err("comment length {comment_len} is greater than {comment_allowed}")
+            return False
+
+    if program_state["verbose"] >= 1:
+        metadata = response_json.get("metadata", False)
+        if metadata is not False:
+            metadata_json = json_loads(metadata)
+            if metadata_json is not False:
+                print_out(json_dumps(metadata_json))
+
+    return lnurl_pay_invoice(callback, amount, comment)
+
+
+def url_add_protocol(url_no_protocol):
+    """add the protocol to url"""
+    if re.search('\\.onion', url_no_protocol) is not None:
+        return "http://" + url_no_protocol
+    else:
+        return "https://" + url_no_protocol
+
+
+def lnurl_address_handle(address, input_data):
+    """handle address with well known"""
+    username, domain = address.split("@", 1)
+    url = url_add_protocol(domain)
+
+    return lnurl_pay_callback(url + "/.well-known/lnurlp/" + username, input_data)
+
+
+def lnurl_bech32_handle(lnurl, input_data):
+    """handle bech32"""
+    decoded = bech32_decode(lnurl)
+    if decoded is False:
+        print_err("decoding bech32")
+        return False
+
+    return lnurl_pay_callback(decoded, input_data)
+
+
+def lightning_url_handle(lightning_url, input_data):
+    """lightning url handle"""
+    if \
+        re.match('^lnbc', lightning_url) is not None or \
+        re.match('^LNBC', lightning_url) is not None:
+        if input_data["amount"] is not None:
+            print_err("amount not valid for invoice")
+            return False
+        if input_data["comment"] is not None:
+            print_err("comment not valid for invoice")
+            return False
+
+        return lightning_url
+    elif \
+        re.match('^lnurl', lightning_url) is not None or \
+        re.match('^LNURL', lightning_url) is not None:
+        return lnurl_bech32_handle(lightning_url, input_data)
+    else:
+        print_err(f"{lightning_url} not recognized")
+        return False
+
+
+def input_string_handle(input_string, input_data):
+    """handle the input"""
+    if re.match('^lightning://', input_string) is not None:
+        return lightning_url_handle(input_string.split("/")[2], input_data)
+    elif re.match('^lnurlp://', input_string) is not None:
+        return lnurl_pay_callback(url_add_protocol(input_string.split("/")[2]), input_data)
+    elif \
+        re.match('^http://', input_string) is not None or \
+        re.match('^https://', input_string) is not None:
+        return lnurl_pay_callback(input_string, input_data)
+    elif re.search('@', input_string) is not None:
+        return lnurl_address_handle(input_string, input_data)
+    elif re.search('\\.', input_string) is not None:
+        return lnurl_pay_callback(url_add_protocol(input_string), input_data)
+    else:
+        return lightning_url_handle(input_string, input_data)
+
+
+def main(argv):
+    """main function"""
+    if len(argv) < 1:
+        print_err("insert arguments")
+        return False
+
+    while len(argv) > 0:
+        first_arg = argv[0]
+        if first_arg in ("-h", "--help"):
+            print_out(INFO, end="")
+            return True
+        elif first_arg in ("-v", "--verbose"):
+            program_state["verbose"] = 1
+            argv = argv[1:]
+        elif first_arg in ("-vv", "--very-verbose"):
+            program_state["verbose"] = 2
+            argv = argv[1:]
+        elif first_arg in ("-d", "--decode"):
+            program_state["decode"] = True
+            argv = argv[1:]
+        elif re.match('^-', first_arg) is not None:
+            print_err(f"{first_arg} not recognized")
+            return False
+        else:
+            break
+
+    if len(argv) < 1:
+        print_err("insert data")
+        return False
+    input_string = argv[0]
+    argv = argv[1:]
+
+    amount = None
+    if len(argv) >= 1:
+        amount_sat = get_uint(argv[0])
+        if amount_sat is False:
+            return False
+        argv = argv[1:]
+        amount = amount_sat * 1000
+
+    comment = None
+    if len(argv) >= 1:
+        comment = argv[0]
+        argv = argv[1:]
+
+    invoice = input_string_handle(input_string, {
+        "amount": amount,
+        "comment": comment
+    })
+    if invoice is False:
+        return False
+
+    print_out(invoice)
+
+    return True
+
+
+if __name__ == "__main__":
+    if main(sys.argv[1:]) is False:
+        sys.exit(1)
+    else:
+        sys.exit(0)

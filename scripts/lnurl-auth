@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+
+"""lnurl auth"""
+
+# requirements: requests[socks] ecdsa
+
+# https://github.com/sipa/bech32/blob/master/ref/python/segwit_addr.py
+# https://github.com/lnurl/luds/blob/luds/01.md
+# https://github.com/lnurl/luds/blob/luds/04.md
+# https://github.com/lnurl/luds/blob/luds/05.md
+# https://github.com/lnurl/luds/blob/luds/13.md
+# https://github.com/lnurl/luds/blob/luds/17.md
+
+# some code adapted from Pieter Wuille reference implementation for bech32/bech32m
+# some code adapted from https://github.com/lnbits/lnurl
+
+import sys
+import re
+import json
+import io
+import hashlib
+import hmac
+
+import requests
+import ecdsa
+
+
+INFO = """\
+lnurl-auth [-v | -vv] [--linking-key] [--hex] [--no-hmac] data
+
+data can be:
+    lnurl bech32, lnurl url, lnurl protocol
+
+in stdin it should be present the secret/linking-key
+
+if --linking-key, directly use the string passed in stdin as linking-key
+if --hex, treat the string in stdin as an hexadecimal
+if --no-hmac, do not hmac with the url
+"""
+
+program_state = {
+    "verbose": 0
+}
+
+
+def bech32_polymod(values):
+    """Internal function that computes the Bech32 checksum."""
+    generator = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for value in values:
+        top = chk >> 25
+        chk = (chk & 0x1ffffff) << 5 ^ value
+        for i in range(5):
+            chk ^= generator[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def bech32_hrp_expand(hrp):
+    """Expand the HRP into values for checksum computation."""
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+
+def bech32_verify_checksum(hrp, data):
+    """Verify a checksum given HRP and converted data characters."""
+    bech32m_const = 0x2bc830a3
+    const = bech32_polymod(bech32_hrp_expand(hrp) + data)
+    if const == 1:
+        return "BECH32"
+    if const == bech32m_const:
+        return "BECH32M"
+    return None
+
+
+def bech32_decode_data(bech):
+    """Validate a Bech32/Bech32m string, and determine HRP and data."""
+    charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+    if ((any(ord(x) < 33 or ord(x) > 126 for x in bech)) or
+            (bech.lower() != bech and bech.upper() != bech)):
+        return (None, None, None)
+    bech = bech.lower()
+    pos = bech.rfind('1')
+    # max_pos = 90
+    max_pos = 1023
+    if pos < 1 or pos + 7 > len(bech) or len(bech) > max_pos:
+        return (None, None, None)
+    if not all(x in charset for x in bech[pos+1:]):
+        return (None, None, None)
+    hrp = bech[:pos]
+    data = [charset.find(x) for x in bech[pos+1:]]
+    spec = bech32_verify_checksum(hrp, data)
+    if spec is None:
+        return (None, None, None)
+    return (hrp, data[:-6], spec)
+
+
+def convertbits(data, frombits, tobits, pad=True):
+    """General power-of-2 base conversion."""
+    acc = 0
+    bits = 0
+    ret = []
+    maxv = (1 << tobits) - 1
+    max_acc = (1 << (frombits + tobits - 1)) - 1
+    for value in data:
+        if value < 0 or (value >> frombits):
+            return None
+        acc = ((acc << frombits) | value) & max_acc
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            ret.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        return None
+    return ret
+
+
+def decoded_to_string(decoded):
+    """Convert decoded array to string"""
+    return bytes(decoded).decode("utf-8")
+
+
+def bech32_decode(input_data):
+    """decode bech32 input"""
+    hrp, data, spec = bech32_decode_data(input_data)
+    if hrp is None or data is None or spec is None:
+        print_err("decoding bech32")
+        return False
+
+    decoded = convertbits(data, 5, 8, False)
+    if decoded is None:
+        print_err("converting bits")
+        return False
+
+    return decoded_to_string(decoded)
+
+
+def print_out(string, end="\n"):
+    """Print to stdout"""
+
+    print(string, end=end)
+
+
+def print_err(string, end="\n", error=True):
+    """Print an error to stderr"""
+    string_print = string
+    if error:
+        string_print = "error: " + string_print
+
+    print(string_print, end=end, file=sys.stderr)
+
+
+def int_to_bytes_suitable_der(x: int):
+    """for strict DER we need to encode the integer with some quirks"""
+
+    b = x.to_bytes((x.bit_length() + 7) // 8, "big")
+
+    if len(b) == 0:
+        # ensure there's at least one byte when the int is zero
+        return bytes([0])
+
+    if b[0] & 0x80 != 0:
+        # ensure it doesn't start with a 0x80 and so it isn't
+        # interpreted as a negative number
+        return bytes([0]) + b
+
+    return b
+
+
+def encode_strict_der(r: int, s: int, order: int):
+    """encode function"""
+
+    # if s > order/2 verification will fail sometimes
+    # so we must fix it here see:
+    # https://github.com/indutny/elliptic/blob/e71b2d9359c5fe9437fbf46f1f05096de447de57/lib/elliptic/ec/index.js#L146-L147
+    if s > order // 2:
+        s = order - s
+
+    # now we do the strict DER encoding copied from
+    # https://github.com/KiriKiri/bip66 (without any checks)
+    r_temp = int_to_bytes_suitable_der(r)
+    s_temp = int_to_bytes_suitable_der(s)
+
+    r_len = len(r_temp)
+    s_len = len(s_temp)
+    sign_len = 6 + r_len + s_len
+
+    signature = io.BytesIO()
+    signature.write(0x30.to_bytes(1, "big", signed=False))
+    signature.write((sign_len - 2).to_bytes(1, "big", signed=False))
+    signature.write(0x02.to_bytes(1, "big", signed=False))
+    signature.write(r_len.to_bytes(1, "big", signed=False))
+    signature.write(r_temp)
+    signature.write(0x02.to_bytes(1, "big", signed=False))
+    signature.write(s_len.to_bytes(1, "big", signed=False))
+    signature.write(s_temp)
+
+    return signature.getvalue()
+
+
+def lnurlauth_signature_from_linking_key(linking_key: bytes, k1: bytes):
+    """get the signature from the linking key"""
+
+    auth_key = ecdsa.SigningKey.from_string(
+        linking_key, curve=ecdsa.SECP256k1, hashfunc=hashlib.sha256
+    )
+
+    sig = auth_key.sign_digest_deterministic(
+        k1, sigencode=encode_strict_der
+    )
+
+    if not auth_key.verifying_key:
+        print_err("LNURLauth verifying_key does not exist")
+        return False, False
+
+    key = auth_key.verifying_key.to_string("compressed")
+
+    return key.hex(), sig.hex()
+
+
+def lnurlauth_signature_from_secret_and_hmac(
+    secret: bytes, k1: bytes, hmac_msg: bytes | None
+):
+    """get the signature from the secret and the hmac message"""
+
+    hashing_key = hashlib.sha256(secret).digest()
+    if hmac_msg is not None:
+        linking_key = hmac.digest(hashing_key, hmac_msg, "sha256")
+    else:
+        linking_key = hashing_key
+
+    return lnurlauth_signature_from_linking_key(linking_key, k1)
+
+
+def bytes_from_hex(string):
+    """bytes from hex handling exception"""
+    try:
+        return bytes.fromhex(string)
+    except ValueError:
+        return False
+
+
+def json_loads(data):
+    """convert string to json dict"""
+    try:
+        return json.loads(data)
+    except json.decoder.JSONDecodeError:
+        return False
+
+
+def json_dumps(data):
+    """convert json dict to string"""
+    return json.dumps(data, indent=4)
+
+
+def requests_tor(url):
+    """make a requests using tor"""
+    proxies = {
+        "http": "socks5h://127.0.0.1:9050",
+        "https": "socks5h://127.0.0.1:9050"
+    }
+
+    # requests.utils.default_headers()
+    headers = {
+        "User-Agent": "python",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept": "*/*",
+        "Connection": "keep-alive"
+    }
+
+    timeout = 120
+
+    try:
+        response = requests.get(
+            url, proxies=proxies, timeout=timeout, headers=headers
+        )
+
+        if not hasattr(response, "text"):
+            print_err("response does not have text")
+            return False
+
+        return response.text
+    except requests.exceptions.RequestException as e:
+        print_err(e, error=False)
+        print_err("getting response")
+        return False
+
+
+def lnurl_auth(lnurl_decoded: str, input_data: dict):
+    """auth url from decoded url"""
+    secret: bytes | None = input_data["secret"]
+    use_hmac: bool = input_data["use_hmac"]
+    linking_key: bytes | None = input_data["linking_key"]
+
+    if program_state["verbose"] >= 1:
+        print_out(lnurl_decoded)
+
+    url_split = lnurl_decoded.split("?", 2)
+    if len(url_split) != 2:
+        print_err("wrong url no get variables")
+        print_err(lnurl_decoded, error=False)
+        return False
+
+    callback, url_variables = url_split
+
+    variables: dict[str, str] = {
+        "tag": "",
+        "k1": "",
+        "hmac": "",
+        "action": "",
+    }
+
+    for key_value_string in url_variables.split("&"):
+        key_value = key_value_string.split("=", 2)
+        if len(key_value) != 2:
+            print_err(f"wrong key value {key_value_string}")
+            return False
+
+        key, value = key_value
+        if key not in variables:
+            print_err(f"key {key} in url response not recognized")
+            return False
+
+        variables[key] = value
+
+    variables_tag = variables["tag"]
+    variables_tag_correct = "login"
+    if variables_tag != variables_tag_correct:
+        print_err(f"tag {variables_tag} is not {variables_tag_correct}")
+        return False
+    if variables["k1"] == "":
+        print_err("k1 not present in url")
+        return False
+
+    if program_state["verbose"] >= 2:
+        print_out(json_dumps(variables))
+
+    k1_string = variables["k1"]
+    k1_bytes = bytes_from_hex(k1_string)
+    if k1_bytes is False:
+        print_err(f"k1 {k1_string} is not an hex")
+        return False
+    if linking_key is None:
+        if secret is None:
+            print_err("secret is not set")
+            return False
+
+        if use_hmac:
+            hmac_msg_string = callback.split("/")[2]
+            if program_state["verbose"] >= 1:
+                print_out(hmac_msg_string)
+            hmac_msg = hmac_msg_string.encode()
+        else:
+            hmac_msg = None
+
+        key, sig = lnurlauth_signature_from_secret_and_hmac(
+            secret, k1_bytes, hmac_msg
+        )
+    else:
+        key, sig = lnurlauth_signature_from_linking_key(
+            linking_key, k1_bytes
+        )
+    if key is False or sig is False:
+        return False
+
+    url_sig_full = lnurl_decoded + "&sig=" + sig + "&key=" + key
+    if program_state["verbose"] >= 1:
+        print_out(url_sig_full)
+
+    response_sig = requests_tor(url_sig_full)
+    if response_sig is False:
+        print_err("wrong response sig")
+        return False
+
+    response_sig_json = json_loads(response_sig)
+    if response_sig_json is False:
+        print_err(response_sig, error=False)
+        print_err("signature response is not json")
+        return False
+
+    sig_status = response_sig_json.get("status", False)
+    if sig_status is False:
+        print_err(json_dumps(response_sig_json), error=False)
+        print_err("status is not present")
+        return False
+    if sig_status != "OK":
+        print_err(json_dumps(response_sig_json), error=False)
+        print_err(f"status {sig_status} is not OK")
+        return False
+
+    print_out(json_dumps(response_sig_json))
+
+    return True
+
+
+def url_add_protocol(url_no_protocol):
+    """add the protocol to url"""
+    if re.search('\\.onion', url_no_protocol) is not None:
+        return "http://" + url_no_protocol
+    else:
+        return "https://" + url_no_protocol
+
+
+def lnurl_bech32_handle(lnurl, input_data):
+    """handle bech32 lnurl"""
+    lnurl_decoded = bech32_decode(lnurl)
+    if lnurl_decoded is False:
+        print_err("decoding bech32 lnurl")
+        return False
+
+    return lnurl_auth(lnurl_decoded, input_data)
+
+
+def lightning_url_handle(lightning_url, input_data):
+    """lightning url handle"""
+    if \
+        re.match('^lnurl', lightning_url) is not None or \
+        re.match('^LNURL', lightning_url) is not None:
+        return lnurl_bech32_handle(lightning_url, input_data)
+    else:
+        print_err(f"{lightning_url} not recognized")
+        return False
+
+
+def input_string_handle(input_string, input_data):
+    """auth url from lnurl"""
+    if re.match('^lightning://', input_string) is not None:
+        return lightning_url_handle(input_string.split("/")[2], input_data)
+    elif re.match('^keyauth://', input_string) is not None:
+        return lnurl_auth(url_add_protocol(input_string.split("/")[2]), input_data)
+    elif \
+        re.match('^http://', input_string) is not None or \
+        re.match('^https://', input_string) is not None:
+        return lnurl_auth(input_string, input_data)
+    elif re.search('\\.', input_string) is not None:
+        return lnurl_auth(url_add_protocol(input_string), input_data)
+    else:
+        return lightning_url_handle(input_string, input_data)
+
+
+def main(argv):
+    """main function"""
+
+    if len(argv) < 1:
+        print_err("insert arguments")
+        return False
+
+    input_is_linking_key = False
+    input_is_hex = False
+    use_hmac = True
+
+    while len(argv) > 0:
+        first_arg = argv[0]
+        if first_arg in ("-h", "--help"):
+            print_out(INFO, end="")
+            return True
+        elif first_arg in ("-v", "--verbose"):
+            program_state["verbose"] = 1
+            argv = argv[1:]
+        elif first_arg in ("-vv", "--very-verbose"):
+            program_state["verbose"] = 2
+            argv = argv[1:]
+        elif first_arg == "--linking-key":
+            input_is_linking_key = True
+            argv = argv[1:]
+        elif first_arg == "--hex":
+            input_is_hex = True
+            argv = argv[1:]
+        elif first_arg == "--no-hmac":
+            use_hmac = False
+            argv = argv[1:]
+        elif re.match('^-', first_arg) is not None:
+            print_err(f"{first_arg} not recognized")
+            return False
+        else:
+            break
+
+    if len(argv) < 1:
+        print_err("insert url")
+        return False
+    input_string = argv[0]
+    argv = argv[1:]
+
+    input_stdin = sys.stdin.readline().rstrip()
+    if input_is_hex is False:
+        input_bytes = input_stdin.encode()
+    else:
+        input_bytes = bytes_from_hex(input_stdin)
+        if input_bytes is False:
+            print_err(f"input {input_stdin} is not hex")
+            return False
+
+    if input_is_linking_key is False:
+        secret = input_bytes
+        linking_key = None
+    else:
+        secret = None
+        linking_key = input_bytes
+
+    return input_string_handle(input_string, {
+        "secret": secret,
+        "use_hmac": use_hmac,
+        "linking_key": linking_key
+    })
+
+
+if __name__ == "__main__":
+    if main(sys.argv[1:]) is True:
+        sys.exit(0)
+    else:
+        sys.exit(1)
