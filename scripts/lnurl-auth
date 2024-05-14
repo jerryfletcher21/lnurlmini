@@ -11,8 +11,8 @@
 # https://github.com/lnurl/luds/blob/luds/13.md
 # https://github.com/lnurl/luds/blob/luds/17.md
 
-# some code adapted from Pieter Wuille reference implementation for bech32/bech32m
-# some code adapted from https://github.com/lnbits/lnurl
+# bech32 decoder adapted from Pieter Wuille reference implementation for bech32/bech32m
+# signature creation adapted from https://github.com/lnbits/lnurl
 
 import sys
 import re

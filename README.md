@@ -13,17 +13,21 @@ everywhere.
 Decode an lnurl bech32/url/protocol/address, make the lnurl pay requests
 and get an invoice.
 
-Supports
-[payRequest basespec](https://github.com/lnurl/luds/blob/luds/06.md),
-[comments in payRequest](https://github.com/lnurl/luds/blob/luds/12.md),
-[paying to static internet identifiers](https://github.com/lnurl/luds/blob/luds/16.md),
-[scheme prefixes and raw (non bech32-encoded) URLs](https://github.com/lnurl/luds/blob/luds/17.md),
-[lightning address](https://github.com/andrerfneves/lightning-address/blob/main/DIY.md).
+Supports:
+* [06](https://github.com/lnurl/luds/blob/luds/06.md)
+  `payRequest` base spec
+* [12](https://github.com/lnurl/luds/blob/luds/12.md)
+  comments in `payRequest`
+* [16](https://github.com/lnurl/luds/blob/luds/16.md)
+  paying to static internet identifiers
+* [17](https://github.com/lnurl/luds/blob/luds/17.md)
+  scheme prefixes and raw (non bech32-encoded) URLs
+* [lightning address](https://github.com/andrerfneves/lightning-address/blob/main/DIY.md)
 
 Useful for who runs a lightning node without any external tools, and
 wants to pay lnurls, ln addresses.
 
-requirements: requests[socks]
+requirements: `requests[socks]`
 ```
 lnurl-pay-get-invoice [-v | -vv] [-d, --decode] data [amount] [comment]
 
@@ -42,10 +46,13 @@ if --decode, simply decode the url, without making the requests
 Decode the lnurl bech32/url/protocol, make the lnurl auth requests to
 authenticate.
 
-Supports
-[auth base spec](https://github.com/lnurl/luds/blob/luds/04.md),
-[signMessage-based seed generation for auth protocol](https://github.com/lnurl/luds/blob/luds/13.md),
-[scheme prefixes and raw (non bech32-encoded) URLs](https://github.com/lnurl/luds/blob/luds/17.md).
+Supports:
+* [04](https://github.com/lnurl/luds/blob/luds/04.md)
+  `auth` base spec
+* [13](https://github.com/lnurl/luds/blob/luds/13.md)
+  `signMessage`-based seed generation for `auth` protocol
+* [17](https://github.com/lnurl/luds/blob/luds/17.md)
+  scheme prefixes and raw (non bech32-encoded) URLs
 
 Useful for authenticating in websites directly from the terminal without
 needing extra tools/wallets.
@@ -57,7 +64,7 @@ after obtaining the signature from the lightning node as explained
 cat <signature-file> | lnurl-auth --hex lnurl
 ```
 
-requirements: requests[socks] ecdsa
+requirements: `requests[socks]` `ecdsa`
 ```
 lnurl-auth [-v | -vv] [--linking-key] [--hex] [--no-hmac] data
 
